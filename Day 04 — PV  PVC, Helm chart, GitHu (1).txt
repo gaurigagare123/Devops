@@ -1,0 +1,144 @@
+Day 04 — PV / PVC, Helm chart, GitHub Actions (CI) + ArgoCD (CD)
+PV & PVC (example for MySQL data)
+
+pv-pvc.yaml
+
+apiVersion: v1
+kind: PersistentVolume
+metadata:
+  name: mysql-pv
+spec:
+  capacity:
+    storage: 5Gi
+  accessModes:
+    - ReadWriteOnce
+  hostPath:
+    path: /mnt/data/mysql    # for single-node test only; in prod use storageclass
+---
+apiVersion: v1
+kind: PersistentVolumeClaim
+metadata:
+  name: mysql-pvc
+spec:
+  accessModes:
+    - ReadWriteOnce
+  resources:
+    requests:
+      storage: 5Gi
+
+
+Apply with kubectl apply -f pv-pvc.yaml
+
+For production clusters use a StorageClass (e.g., AWS EBS, GCE PD, Longhorn, NFS dynamic provisioner).
+
+Helm chart skeleton
+
+Create directory helm/todo-app/ with minimal structure:
+
+helm/todo-app/
+├── Chart.yaml
+├── values.yaml
+├── templates/
+    ├── deployment.yaml
+    ├── service.yaml
+    ├── pvc.yaml
+
+
+Chart.yaml
+
+apiVersion: v2
+name: todo-app
+description: Helm chart for todo app
+version: 0.1.0
+
+
+values.yaml (sample)
+
+replicaCount: 2
+image:
+  repository: yourdockerhub/todo-app
+  tag: latest
+service:
+  type: LoadBalancer
+  port: 80
+mysql:
+  enabled: true
+  rootPassword: rootpassword
+  user: todo_user
+  password: password
+  database: mytododb
+persistence:
+  enabled: true
+  size: 5Gi
+
+
+templates/deployment.yaml and others: put Kubernetes templated YAML referring to .Values.*. (If you want, I can generate full templated files next.)
+
+GitHub Actions (CI) — /.github/workflows/ci.yml
+
+This will build the Docker image and push to Docker Hub (you must add secrets).
+
+name: CI - Build & Push
+
+on:
+  push:
+    branches: [ main ]
+
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set up QEMU
+        uses: docker/setup-qemu-action@v2
+
+      - name: Set up Docker Buildx
+        uses: docker/setup-buildx-action@v2
+
+      - name: Login to DockerHub
+        uses: docker/login-action@v2
+        with:
+          username: ${{ secrets.DOCKERHUB_USERNAME }}
+          password: ${{ secrets.DOCKERHUB_TOKEN }}
+
+      - name: Build and push
+        uses: docker/build-push-action@v5
+        with:
+          context: .
+          push: true
+          tags: ${{ secrets.DOCKERHUB_USERNAME }}/todo-app:latest
+
+
+Secrets to add: DOCKERHUB_USERNAME, DOCKERHUB_TOKEN
+
+ArgoCD (CD)
+
+Install ArgoCD in your cluster (official manifests). Then add an ArgoCD Application that points at your Git repo and the Helm chart path.
+
+Example argocd-app.yaml
+
+apiVersion: argoproj.io/v1alpha1
+kind: Application
+metadata:
+  name: todo-app
+  namespace: argocd
+spec:
+  project: default
+  source:
+    repoURL: 'https://github.com/<your-org>/<your-repo>.git'
+    targetRevision: main
+    path: helm/todo-app
+    helm:
+      valueFiles:
+        - values.yaml
+  destination:
+    server: 'https://kubernetes.default.svc'
+    namespace: default
+  syncPolicy:
+    automated:
+      prune: true
+      selfHeal: true
+
+
+Apply with kubectl apply -f argocd-app.yaml after ArgoCD is installed.

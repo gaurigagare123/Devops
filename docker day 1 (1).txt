@@ -1,0 +1,722 @@
+# Update the apt package index
+> sudo apt-get update
+
+# Install prerequisites
+> sudo apt-get install ca-certificates curl gnupg
+
+# Add Docker's official GPG key
+> sudo install -m 0755 -d /etc/apt/keyrings
+> curl -fsSL https://download.docker.com/linux/ubuntu/gpg | sudo gpg --dearmor -o /etc/apt/keyrings/docker.gpg
+> sudo chmod a+r /etc/apt/keyrings/docker.gpg
+
+# Add the Docker repository to Apt sources
+> echo \
+  "deb [arch=$(dpkg --print-architecture) signed-by=/etc/apt/keyrings/docker.gpg] https://download.docker.com/linux/ubuntu \
+  $(. /etc/os-release && echo "$VERSION_CODENAME") stable" | \
+  sudo tee /etc/apt/sources.list.d/docker.list > /dev/null
+
+# Install Docker Engine, Docker CLI, and Containerd
+> sudo apt-get update
+> sudo apt-get install docker-ce docker-ce-cli containerd.io docker-buildx-plugin docker-compose-plugin
+
+> sudo usermod -aG docker $USER
+> newgrp docker
+
+> mkdir todo app 
+> cd ~/todo app
+> sudo nano app.py 
+   import datetime
+from flask import Flask, render_template, request, redirect, url_for, session, flash, g
+from werkzeug.security import generate_password_hash, check_password_hash
+import mysql.connector
+from dotenv import load_dotenv
+import os
+from functools import wraps
+
+# Load environment variables
+load_dotenv()
+
+app = Flask(__name__)
+app.secret_key = os.getenv('SECRET_KEY', 'sunbeam')
+
+@app.context_processor
+def inject_now():
+    return {'now': datetime.datetime.now()}
+
+# Database configuration
+def get_db():
+    if not hasattr(g, 'db'):
+        g.db = mysql.connector.connect(
+            host=os.getenv('DB_HOST', 'localhost'),
+            user=os.getenv('DB_USER', 'todo_user'),
+            password=os.getenv('DB_PASSWORD', 'password'),
+            database=os.getenv('DB_NAME', 'mytododb')
+        )
+    return g.db
+
+def get_cursor():
+    return get_db().cursor(dictionary=True)
+
+@app.teardown_appcontext
+def close_db(error):
+    if hasattr(g, 'db'):
+        g.db.close()
+
+# Helper functions
+def login_required(f):
+    @wraps(f)
+    def decorated_function(*args, **kwargs):
+        if 'user_id' not in session:
+            flash("Please log in to access this page.")
+            return redirect(url_for('login'))
+        return f(*args, **kwargs)
+    return decorated_function
+
+def is_password_complex(password):
+    return (len(password) >= 8 and 
+            any(c.isupper() for c in password) and
+            any(c.isdigit() for c in password))
+
+# Routes
+@app.route('/register', methods=['GET', 'POST'])
+def register():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        
+        if not is_password_complex(password):
+            flash("Password must be at least 8 characters with at least one uppercase letter and one number")
+            return render_template('register.html')
+        
+        hashed_pw = generate_password_hash(password)
+        cursor = get_cursor()
+        
+        try:
+            cursor.execute(
+                "INSERT INTO users (username, password_hash) VALUES (%s, %s)", 
+                (username, hashed_pw)
+            )
+            get_db().commit()
+            flash("Registration successful! Please log in.")
+            return redirect(url_for('login'))
+        except mysql.connector.Error as err:
+            get_db().rollback()
+            if err.errno == 1062:  # Duplicate entry error
+                flash("Username already exists.")
+            else:
+                flash("Registration failed. Please try again.")
+                app.logger.error(f"Registration error: {err}")
+        finally:
+            cursor.close()
+            
+    return render_template('register.html')
+
+@app.route('/login', methods=['GET', 'POST'])
+def login():
+    if request.method == 'POST':
+        username = request.form['username']
+        password = request.form['password']
+        cursor = get_cursor()
+        
+        try:
+            cursor.execute("SELECT * FROM users WHERE username = %s", (username,))
+            user = cursor.fetchone()
+            
+            if user and check_password_hash(user['password_hash'], password):
+                session['user_id'] = user['id']
+                session['username'] = user['username']
+                return redirect(url_for('index'))
+            flash("Invalid credentials.")
+        except mysql.connector.Error as err:
+            flash("Login failed. Please try again.")
+            app.logger.error(f"Login error: {err}")
+        finally:
+            cursor.close()
+            
+    return render_template('login.html')
+
+@app.route('/logout')
+@login_required
+def logout():
+    session.clear()
+    flash("You have been logged out.")
+    return redirect(url_for('login'))
+
+@app.route('/', methods=['GET'])
+@login_required
+def index():
+    status_filter = request.args.get('status')
+    query = "SELECT * FROM tasks WHERE user_id = %s"
+    params = [session['user_id']]
+
+    if status_filter in ['Pending', 'Completed']:
+        query += " AND status = %s"
+        params.append(status_filter)
+
+    cursor = get_cursor()
+    try:
+        cursor.execute(query, tuple(params))
+        tasks = cursor.fetchall()
+        return render_template('index.html', 
+                             tasks=tasks, 
+                             username=session.get('username'), 
+                             filter=status_filter or '')
+    except mysql.connector.Error as err:
+        flash("Error loading tasks.")
+        app.logger.error(f"Task loading error: {err}")
+        return render_template('index.html', tasks=[], username=session.get('username'))
+    finally:
+        cursor.close()
+
+@app.route('/add_task', methods=['POST'])
+@login_required
+def add_task():
+    name = request.form['task_name']
+    status = request.form['status']
+    priority = request.form.get('priority', 'Medium')  # Default to Medium if not provided
+    cursor = get_cursor()
+    
+    try:
+        cursor.execute(
+            "INSERT INTO tasks (name, status, priority, user_id) VALUES (%s, %s, %s, %s)", 
+            (name, status, priority, session['user_id'])
+        )
+        get_db().commit()
+    except mysql.connector.Error as err:
+        get_db().rollback()
+        flash("Failed to add task.")
+        app.logger.error(f"Add task error: {err}")
+    finally:
+        cursor.close()
+    
+    return redirect(url_for('index'))
+
+
+@app.route('/delete_task/<int:task_id>')
+@login_required
+def delete_task(task_id):
+    cursor = get_cursor()
+    try:
+        cursor.execute(
+            "DELETE FROM tasks WHERE id = %s AND user_id = %s", 
+            (task_id, session['user_id'])
+        )
+        get_db().commit()
+    except mysql.connector.Error as err:
+        get_db().rollback()
+        flash("Failed to delete task.")
+        app.logger.error(f"Delete task error: {err}")
+    finally:
+        cursor.close()
+    
+    return redirect(url_for('index'))
+
+@app.route('/complete_task/<int:task_id>')
+@login_required
+def complete_task(task_id):
+    cursor = get_cursor()
+    try:
+        cursor.execute(
+            """UPDATE tasks 
+               SET status = 'Completed', completed_at = NOW() 
+               WHERE id = %s AND user_id = %s""",
+            (task_id, session['user_id'])
+        )
+        get_db().commit()
+    except mysql.connector.Error as err:
+        get_db().rollback()
+        flash("Failed to complete task.")
+        app.logger.error(f"Complete task error: {err}")
+    finally:
+        cursor.close()
+    
+    return redirect(url_for('index'))
+
+@app.route('/edit_task/<int:task_id>', methods=['GET', 'POST'])
+@login_required
+def edit_task(task_id):
+    cursor = get_cursor()
+    try:
+        if request.method == 'POST':
+            new_name = request.form['task_name']
+            cursor.execute(
+                """UPDATE tasks 
+                   SET name = %s 
+                   WHERE id = %s AND user_id = %s""",
+                (new_name, task_id, session['user_id'])
+            )
+            get_db().commit()
+            return redirect(url_for('index'))
+        
+        cursor.execute(
+            "SELECT * FROM tasks WHERE id = %s AND user_id = %s", 
+            (task_id, session['user_id'])
+        )
+        task = cursor.fetchone()
+        return render_template('edit_task.html', task=task)
+    except mysql.connector.Error as err:
+        get_db().rollback()
+        flash("Error editing task.")
+        app.logger.error(f"Edit task error: {err}")
+        return redirect(url_for('index'))
+    finally:
+        cursor.close()
+
+if __name__ == '__main__':
+    app.run(host='0.0.0.0', debug=True)
+
+
+> sudo nano requirements.txt
+   flask
+   python-dotenv
+   mysql-connector-python
+ 
+> sudo nano todo-db.sql
+   -- Create a dedicated database user with appropriate privileges
+CREATE USER 'todo_user'@'localhost' IDENTIFIED BY 'password';
+GRANT ALL PRIVILEGES ON mytododb.* TO 'todo_user'@'localhost';
+FLUSH PRIVILEGES;
+
+-- Create the database
+CREATE DATABASE IF NOT EXISTS mytododb CHARACTER SET utf8mb4 COLLATE utf8mb4_unicode_ci;
+
+-- Use the database
+USE mytododb;
+
+-- Users table
+CREATE TABLE IF NOT EXISTS users (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    username VARCHAR(100) NOT NULL UNIQUE,
+    password_hash VARCHAR(255) NOT NULL,
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    updated_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+-- Tasks table
+CREATE TABLE IF NOT EXISTS tasks (
+    id INT AUTO_INCREMENT PRIMARY KEY,
+    name VARCHAR(255) NOT NULL,
+    status ENUM('Pending', 'Completed') DEFAULT 'Pending',
+    priority ENUM('Low', 'Medium', 'High') DEFAULT 'Medium',
+    created_at TIMESTAMP DEFAULT CURRENT_TIMESTAMP,
+    completed_at TIMESTAMP NULL DEFAULT NULL,
+    user_id INT NOT NULL,
+    FOREIGN KEY (user_id) REFERENCES users(id) ON DELETE CASCADE,
+    INDEX idx_user_id (user_id),
+    INDEX idx_status (status)
+) ENGINE=InnoDB DEFAULT CHARSET=utf8mb4 COLLATE=utf8mb4_unicode_ci;
+
+> mkdir templates 
+> sudo nano templates/base.html
+   <!DOCTYPE html>
+<html lang="en">
+<head>
+    <meta charset="UTF-8">
+    <meta name="viewport" content="width=device-width, initial-scale=1.0">
+    <title>Todo App - {% block title %}{% endblock %}</title>
+    <link href="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/css/bootstrap.min.css" rel="stylesheet">
+    <link rel="stylesheet" href="https://cdn.jsdelivr.net/npm/bootstrap-icons@1.10.0/font/bootstrap-icons.css">
+<style>
+    /* Add these new styles */
+    html, body {
+        height: 100%;
+    }
+    
+    body {
+        display: flex;
+        flex-direction: column;
+    }
+    
+    .container {
+        flex: 1 0 auto;
+        padding-bottom: 20px; /* Add some space above footer */
+    }
+    
+    footer {
+        flex-shrink: 0;
+        width: 100%;
+    }
+</style>
+
+    <style>
+        :root {
+            --primary-color: #6c63ff;
+            --secondary-color: #4d44db;
+            --light-color: #f8f9fa;
+            --dark-color: #343a40;
+        }
+        
+        body {
+            background-color: #f5f5f5;
+            font-family: 'Segoe UI', Tahoma, Geneva, Verdana, sans-serif;
+        }
+        
+        .navbar-brand {
+            font-weight: 700;
+            color: var(--primary-color) !important;
+        }
+        
+/* Add this instead for a more subtle effect */
+    .task-item {
+        transition: background-color 0.2s ease;
+    }
+    
+    .task-item:hover {
+        background-color: #f8f9fa;
+    }
+
+        .btn-primary {
+            background-color: var(--primary-color);
+            border-color: var(--primary-color);
+        }
+        
+        .btn-primary:hover {
+            background-color: var(--secondary-color);
+            border-color: var(--secondary-color);
+        }
+        
+        .completed-task {
+            text-decoration: line-through;
+            color: #6c757d;
+        }
+        
+        .task-actions .btn {
+            padding: 0.25rem 0.5rem;
+            font-size: 0.875rem;
+        }
+        
+        .filter-btns .btn {
+            margin-right: 5px;
+        }
+    </style>
+</head>
+<body>
+    <nav class="navbar navbar-expand-lg navbar-dark bg-dark mb-4">
+        <div class="container">
+            <a class="navbar-brand" href="{{ url_for('index') }}">TodoApp</a>
+            <button class="navbar-toggler" type="button" data-bs-toggle="collapse" data-bs-target="#navbarNav">
+                <span class="navbar-toggler-icon"></span>
+            </button>
+            <div class="collapse navbar-collapse" id="navbarNav">
+                <ul class="navbar-nav ms-auto">
+                    {% if 'user_id' in session %}
+                    <li class="nav-item">
+                        <span class="nav-link text-light">Hello, {{ session['username'] }}</span>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('logout') }}">Logout</a>
+                    </li>
+                    {% else %}
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('login') }}">Login</a>
+                    </li>
+                    <li class="nav-item">
+                        <a class="nav-link" href="{{ url_for('register') }}">Register</a>
+                    </li>
+                    {% endif %}
+                </ul>
+            </div>
+        </div>
+    </nav>
+
+    <div class="container">
+        {% with messages = get_flashed_messages(with_categories=true) %}
+            {% if messages %}
+                {% for category, message in messages %}
+                    <div class="alert alert-{{ 'danger' if category == 'error' else 'success' }} alert-dismissible fade show">
+                        {{ message }}
+                        <button type="button" class="btn-close" data-bs-dismiss="alert"></button>
+                    </div>
+                {% endfor %}
+            {% endif %}
+        {% endwith %}
+
+        {% block content %}{% endblock %}
+    </div>
+
+<footer class="mt-auto py-3 bg-dark text-white">
+    <div class="container text-center">
+        <p class="mb-0">© {{ now.year }} SunBeam Infotech Pvt. Ltd. - TodoApp. All rights reserved.</p>
+    </div>
+</footer>
+
+    <script src="https://cdn.jsdelivr.net/npm/bootstrap@5.3.0/dist/js/bootstrap.bundle.min.js"></script>
+</body>
+</html>
+
+
+> sudo nano templates/edit_task.html
+  {% extends "base.html" %}
+
+{% block title %}Edit Task{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0">Edit Task</h4>
+            </div>
+            <div class="card-body">
+                <form action="{{ url_for('edit_task', task_id=task.id) }}" method="POST">
+                    <div class="mb-3">
+                        <label for="task_name" class="form-label">Task Description</label>
+                        <input type="text" class="form-control" id="task_name" name="task_name" value="{{ task.name }}" required>
+                    </div>
+                    <div class="d-grid gap-2 d-md-flex justify-content-md-end">
+                        <a href="{{ url_for('index') }}" class="btn btn-secondary me-md-2">
+                            <i class="bi bi-arrow-left"></i> Cancel
+                        </a>
+                        <button type="submit" class="btn btn-primary">
+                            <i class="bi bi-save"></i> Save Changes
+                        </button>
+                    </div>
+                </form>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+> sudo nano templates/index.html
+   {% extends "base.html" %}
+
+{% block title %}My Tasks{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-8">
+        <div class="card mb-4">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0">Add New Task</h4>
+            </div>
+            <div class="card-body">
+                <form action="{{ url_for('add_task') }}" method="POST">
+		<div class="input-group mb-3">
+    <input type="text" class="form-control" name="task_name" placeholder="Task description" required>
+    <select class="form-select" name="status" style="max-width: 120px;">
+        <option value="Pending">Pending</option>
+        <option value="Completed">Completed</option>
+    </select>
+    <select class="form-select" name="priority" style="max-width: 120px;">
+        <option value="Low">Low</option>
+        <option value="Medium" selected>Medium</option>
+        <option value="High">High</option>
+    </select>
+    <button class="btn btn-primary" type="submit">
+        <i class="bi bi-plus-circle"></i> Add
+    </button>
+</div>
+
+                </form>
+            </div>
+        </div>
+
+        <div class="card">
+            <div class="card-header d-flex justify-content-between align-items-center">
+                <h4 class="mb-0">My Tasks</h4>
+                <div class="filter-btns">
+                    <a href="{{ url_for('index') }}" class="btn btn-sm btn-outline-dark {% if not filter %}active{% endif %}">All</a>
+                    <a href="{{ url_for('index', status='Pending') }}" class="btn btn-sm btn-outline-warning {% if filter == 'Pending' %}active{% endif %}">Pending</a>
+                    <a href="{{ url_for('index', status='Completed') }}" class="btn btn-sm btn-outline-success {% if filter == 'Completed' %}active{% endif %}">Completed</a>
+                </div>
+            </div>
+            <div class="card-body">
+                {% if tasks %}
+                <ul class="list-group list-group-flush">
+                    {% for task in tasks %}
+                    <li class="list-group-item task-item d-flex justify-content-between align-items-center {% if task.status == 'Completed' %}completed-task{% endif %}">
+			<div>
+                            <h5 class="mb-1">{{ task.name }}</h5>
+                            <small class="text-muted">
+                                <span class="badge bg-{% if task.priority == 'High' %}danger{% elif task.priority == 'Medium' %}warning{% else %}info{% endif %}">
+                {{ task.priority }}
+            </span>
+                                Created: {{ task.created_at.strftime('%Y-%m-%d %H:%M') }}
+                                {% if task.completed_at %}
+                                | Completed: {{ task.completed_at.strftime('%Y-%m-%d %H:%M') }}
+                                {% endif %}
+                            </small>
+                        </div>
+                        <div class="task-actions">
+                            {% if task.status == 'Pending' %}
+                            <a href="{{ url_for('complete_task', task_id=task.id) }}" class="btn btn-sm btn-success" title="Mark Complete">
+                                <i class="bi bi-check-circle"></i>
+                            </a>
+                            {% endif %}
+                            <a href="{{ url_for('edit_task', task_id=task.id) }}" class="btn btn-sm btn-primary" title="Edit">
+                                <i class="bi bi-pencil"></i>
+                            </a>
+                            <a href="{{ url_for('delete_task', task_id=task.id) }}" class="btn btn-sm btn-danger" title="Delete" onclick="return confirm('Are you sure?')">
+                                <i class="bi bi-trash"></i>
+                            </a>
+                        </div>
+                    </li>
+
+			<!-- <li class="list-group-item task-item d-flex justify-content-between align-items-center {% if task.status == 'Completed' %}completed-task{% endif %}">
+    <div>
+        <h5 class="mb-1">{{ task.name }}</h5>
+        <small class="text-muted">
+            <span class="badge bg-{% if task.priority == 'High' %}danger{% elif task.priority == 'Medium' %}warning{% else %}info{% endif %}">
+                {{ task.priority }}
+            </span>
+            • Created: {{ task.created_at.strftime('%Y-%m-%d %H:%M') }}
+            {% if task.completed_at %}
+            • Completed: {{ task.completed_at.strftime('%Y-%m-%d %H:%M') }}
+            {% endif %}
+        </small>
+    </div>
+    
+</li> -->
+                    {% endfor %}
+                </ul>
+                {% else %}
+                <div class="text-center py-4">
+                    <i class="bi bi-check2-circle" style="font-size: 3rem; color: #6c757d;"></i>
+                    <h5 class="mt-3">No tasks found</h5>
+                    <p>Add your first task using the form above</p>
+                </div>
+                {% endif %}
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+> sudo nano templates/login.html
+   {% extends "base.html" %}
+
+{% block title %}Login{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0">Login</h4>
+            </div>
+            <div class="card-body">
+                <form action="{{ url_for('login') }}" method="POST">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="username" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-box-arrow-in-right"></i> Login
+                    </button>
+                </form>
+                <div class="mt-3 text-center">
+                    <p>Don't have an account? <a href="{{ url_for('register') }}">Register here</a></p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+
+> sudo nano templates/register.html
+   {% extends "base.html" %}
+
+{% block title %}Register{% endblock %}
+
+{% block content %}
+<div class="row justify-content-center">
+    <div class="col-md-6">
+        <div class="card">
+            <div class="card-header bg-primary text-white">
+                <h4 class="mb-0">Register</h4>
+            </div>
+            <div class="card-body">
+                <form action="{{ url_for('register') }}" method="POST">
+                    <div class="mb-3">
+                        <label for="username" class="form-label">Username</label>
+                        <input type="text" class="form-control" id="username" name="username" required>
+                    </div>
+                    <div class="mb-3">
+                        <label for="password" class="form-label">Password</label>
+                        <input type="password" class="form-control" id="password" name="password" required>
+                        <div class="form-text">Password must be at least 8 characters with uppercase and number</div>
+                    </div>
+                    <button type="submit" class="btn btn-primary w-100">
+                        <i class="bi bi-person-plus"></i> Register
+                    </button>
+                </form>
+                <div class="mt-3 text-center">
+                    <p>Already have an account? <a href="{{ url_for('login') }}">Login here</a></p>
+                </div>
+            </div>
+        </div>
+    </div>
+</div>
+{% endblock %}
+
+> sudo nano Dockerfile 
+   # Stage 1: The Build Stage
+FROM python:3.10-bullseye
+
+# Set the working directory
+WORKDIR /app
+
+# Copy the requirements file and install dependencies
+COPY requirements.txt .
+RUN  pip install --no-cache-dir -r requirements.txt
+
+# Copy the application code
+COPY . .
+
+# Expose the port the app runs on
+EXPOSE 5000
+
+# Run the application
+CMD ["python", "app.py"]
+
+> docker build -t todo-app-image:v1 .
+> sudo nano docker-compose.yml
+   version: "3.8"
+services:
+  db:
+    image: mysql:8.0
+    container_name: todo-mysql
+    restart: unless-stopped
+    environment:
+      MYSQL_ROOT_PASSWORD: rootpassword          # change for production
+      MYSQL_DATABASE: mytododb
+      MYSQL_USER: todo_user
+      MYSQL_PASSWORD: password
+    volumes:
+      - db_data:/var/lib/mysql
+      - ./todo-db.sql:/docker-entrypoint-initdb.d/todo-db.sql:ro
+    ports:
+      - "3306:3306"
+
+  app:
+    build: .
+    container_name: todo-app
+    restart: unless-stopped
+    depends_on:
+      - db
+    environment:
+      DB_HOST: db
+      DB_USER: todo_user
+      DB_PASSWORD: password
+      DB_NAME: mytododb
+      SECRET_KEY: "change_this_secret"
+      FLASK_ENV: development
+    ports:
+      - "5000:5000"
+    volumes:
+      - ./:/app
+    command: ["flask", "run", "--host=0.0.0.0", "--port=5000"]
+
+volumes:
+  db_data:
+
+> docker compose up -d
+> docker ps
